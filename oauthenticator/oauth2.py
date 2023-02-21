@@ -499,6 +499,7 @@ class OAuthenticator(Authenticator):
                 bytes("{self.client_id}:{self.client_secret}", "utf8")
             )
             headers.update({"Authorization": f'Basic {b64key.decode("utf8")}'})
+
         return headers
 
     def user_info_to_username(self, user_info):
@@ -550,6 +551,25 @@ class OAuthenticator(Authenticator):
             )
             return
 
+    def build_refresh_token_request_params(self, refresh_token):
+        """
+        Builds the parameters that should be passed to the URL request
+        that requests a refreshed token.
+        Called by the :meth:`oauthenticator.OAuthenticator.refresh_user`.
+        """
+
+        params = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": " ".join(self.scope),
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }
+
+        params.update(self.token_params)
+
+        return params
+
     def build_access_tokens_request_params(self, handler, data=None):
         """
         Builds the parameters that should be passed to the URL request
@@ -570,16 +590,15 @@ class OAuthenticator(Authenticator):
         # the client_id and client_secret should not be included in the access token request params
         # when basic authentication is used
         # ref: https://www.rfc-editor.org/rfc/rfc6749#section-2.3.1
-        if self.basic_auth:
-            params.update(
-                [("client_id", self.client_id), ("client_secret", self.client_secret)]
-            )
+        params.update(
+            [("client_id", self.client_id), ("client_secret", self.client_secret)]
+        )
 
         params.update(self.token_params)
 
         return params
 
-    async def get_token_info(self, handler, params):
+    async def get_token_info(self, handler, params, headers=None):
         """
         Makes a "POST" request to `self.token_url`, with the parameters received as argument.
 
@@ -590,10 +609,13 @@ class OAuthenticator(Authenticator):
         """
         url = url_concat(self.token_url, params)
 
+        if headers is None:
+            headers = self.build_token_info_request_headers()
+
         req = HTTPRequest(
             url,
             method="POST",
-            headers=self.build_token_info_request_headers(),
+            headers=headers,
             body=json.dumps(params),
             validate_cert=self.validate_server_cert,
         )
@@ -748,6 +770,39 @@ class OAuthenticator(Authenticator):
 
         # update the auth model with any info if available
         return await self.update_auth_model(auth_model, **kwargs)
+
+    async def refresh_user(self, user, handler=None):
+        self.log.info("refreshing upstream oauth token for %s", user)
+        auth_state = await user.get_auth_state()
+
+        refresh_token = auth_state.get('refresh_token', None)
+        if refresh_token is None:
+            self.log.info("no refresh token, aborting")
+            return True
+
+        refresh_token_params = self.build_refresh_token_request_params(
+            refresh_token=refresh_token
+        )
+        headers = self.build_userdata_request_headers(
+            auth_state["access_token"], auth_state["token_response"]["token_type"]
+        )
+
+        try:
+            token_resp_json = await self.get_token_info(
+                handler, refresh_token_params, headers=headers
+            )
+        except Exception as e:
+            self.log.info("error refreshing %s", e)
+            return True
+
+        auth_state["token_response"] = token_resp_json
+        auth_state["access_token"] = token_resp_json["access_token"]
+        auth_state["refresh_token"] = token_resp_json["refresh_token"]
+        auth_state["refresh_counter"] = auth_state.get("refresh_counter", 0) + 1
+
+        self.log.info("refresh successful, got new access token for %s", user)
+
+        return {"auth_state": auth_state}
 
     _deprecated_oauth_aliases = {}
 
